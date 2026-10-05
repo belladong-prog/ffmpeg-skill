@@ -38,6 +38,8 @@ S-Log, V-Log and C-Log look grey and low-contrast but are tagged SDR. Run
 ### Keyframe cuts
 A lossless `cut.py` result may start up to one GOP (often 1–10 s) earlier than
 requested; the script re-encodes automatically when the deviation exceeds 0.5 s.
+Its end is exact when it falls on a keyframe; inside a GOP the copy keeps the few
+frames past it that the kept frames need to decode.
 If the user insists on lossless output, pass `--tolerance -1` and tell them the
 cut lands on the nearest earlier keyframe. A `-c copy` cut on VFR or a
 non-keyframe boundary produces a file that "works" but starts on a frozen or

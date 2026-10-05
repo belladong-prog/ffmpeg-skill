@@ -32,7 +32,7 @@ import tempfile
 from typing import List, Tuple
 
 from _common import (beat_grid, snap_points, decode_pcm_mono, rms_envelope, BEAT_MIN_CONFIDENCE)
-from _common import video_args, STATE, add_common, apply_common, audio_codec_for, emit, aac_args, cfr_args, default_output, die, ffmpeg_base, info, is_audio_output, time_arg, probe, run, X264_PRESETS, keyframes_near, MissingFpsError, concat_list_line, refuse_output_is_input, fmt_secs
+from _common import video_args, STATE, add_common, apply_common, audio_codec_for, emit, aac_args, cfr_args, default_output, die, ffmpeg_base, info, is_audio_output, time_arg, probe, run, require_tool, X264_PRESETS, keyframes_near, MissingFpsError, concat_list_line, refuse_output_is_input, fmt_secs
 
 # outputs whose re-encode dropped a subtitle/data stream (reported as dropped_non_av_streams)
 DROPPED_STREAMS: List[str] = []
@@ -150,7 +150,79 @@ def cut_one(src: str, start: float, end: float, dst: str, reencode: bool, crf: i
             info(f"stream copy landed on a keyframe {abs(got - dur):.2f}s away from the requested cut "
                  f"(> {tolerance:.2f}s tolerance); re-encoding this segment for accuracy{alt}")
             return cut_one(src, start, end, dst, True, crf, preset, tolerance, meta)
+    if not reencode and not audio_only and not STATE.dry_run:
+        trim_copy_tail(src, start, end, dst, meta)
     return reencode
+
+
+def _video_packets(path: str, interval: str = "%") -> List[Tuple[float, float]]:
+    """(pts, dts) of the first video stream's packets in an ffprobe -read_intervals span, in decode order."""
+    proc = run([require_tool("ffprobe"), "-v", "error", "-select_streams", "v:0", "-read_intervals", interval,
+                "-show_entries", "packet=pts_time,dts_time", "-of", "csv=p=0", path], quiet=True, check=False)
+    out: List[Tuple[float, float]] = []
+    for line in proc.stdout.splitlines() if proc.returncode == 0 else []:
+        try:
+            pts, dts = (float(v) for v in line.strip().split(",")[:2])
+        except ValueError:
+            continue
+        out.append((pts, dts))
+    return out
+
+
+def trim_copy_tail(src: str, start: float, end: float, dst: str, meta: dict) -> None:
+    """Drop the frames a stream copy kept past `end`. The copy stops on decode order, and with
+    B-frames the next GOP's keyframe and the frame after it decode before the last frames shown, so
+    they were kept: two to four frames past --end, which a multi-segment join plays as a flash of
+    the span it removed, even with every boundary on a keyframe. When the frames before `end` are a
+    decode-order prefix (the end is a closed-GOP boundary), nothing kept references a dropped frame,
+    so the picture is copied again with a tighter limit until exactly those frames remain; the sound
+    is copied untouched. Otherwise the extra frames are needed to decode the kept ones and stay."""
+    fps = (meta.get("video") or {}).get("fps") or 0
+    if fps <= 0:
+        return
+    frame = 1.0 / fps
+    near = [k for k in keyframes_near(src, start, window=frame) if k <= start + frame / 2]
+    origin_src = max(near) if near else start  # where the copy began: the keyframe at or before start
+    keep_until = end - origin_src - frame / 2  # part-relative pts; a frame starting here or later is past end
+    tail = f"{max(0.0, keep_until - 10.0):.3f}%"  # the end is all that changes; a long part is not read whole
+    packets = _video_packets(dst, tail)
+    head = _video_packets(dst, "%+2")
+    if not packets or not head:
+        return
+    origin = min(p for p, _ in head)
+    kept = [(p - origin) < keep_until for p, _ in packets]
+    if all(kept) or not any(kept):
+        return
+    first_dropped = kept.index(False)
+    if any(kept[first_dropped:]):
+        return  # a kept frame decodes after a dropped one and may reference it: leave the copy whole
+    want = sum(kept)
+    tmp = dst + ".tail" + os.path.splitext(dst)[1]
+    limit = end - origin_src
+    try:
+        # the limit is read against decode timestamps whose origin varies by muxer and version, so
+        # it is walked down a quarter frame at a time and each result measured, never computed
+        for _ in range(4 * (len(kept) - want) + 4):
+            limit -= frame / 4
+            if limit <= 0:
+                return
+            cmd = (ffmpeg_base() + ["-t", f"{limit:.6f}", "-i", dst, "-i", dst, "-map", "0:v:0", "-map", "1", "-map", "-1:v:0"]
+                   + copy_args(meta, dst) + [tmp])
+            if run(cmd, check=False).returncode != 0:
+                return
+            got = _video_packets(tmp, tail)
+            got_origin = min((p for p, _ in _video_packets(tmp, "%+2")), default=None)
+            if got_origin is None:
+                return
+            n = sum(1 for p, _ in got if (p - got_origin) < keep_until)
+            if n < want:
+                return  # cut into the frames that belong: keep the first copy
+            if n == len(got):
+                os.replace(tmp, dst)
+                return
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 
 BEAT_RATE = 22050  # the decode rate the onset pass uses, matching scenes.py --beats

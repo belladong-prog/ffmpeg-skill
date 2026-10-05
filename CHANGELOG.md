@@ -4,7 +4,7 @@
 
 ## Unreleased
 
-(nothing yet)
+- fix(cut): a lossless cut keeps no frame past its end. A stream copy stops on decode order, and with B-frames the next GOP's keyframe and the frame after it decode before the last frames shown, so a copy kept two to four frames past `--end`; `--segments 0-4,8-12` on a source with a keyframe every 2 s played frames from the removed 4-8 s span at the join, reported as `mode: copy`. When the frames before the end are a decode-order prefix (the end is a closed-GOP boundary), the picture is copied again with a tighter limit, measured until exactly the requested frames remain; the sound is copied untouched, so a join now holds the last kept frame for those few frames instead of flashing removed ones. An end inside a GOP still keeps the frames the kept ones need to decode.
 
 ## 2.5.1
 

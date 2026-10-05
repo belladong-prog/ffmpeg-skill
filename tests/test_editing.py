@@ -16,7 +16,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _fixtures import MediaFixtures, OUT, SCRIPTS, _is_faststart, script, sh  # noqa: E402
+from _fixtures import MediaFixtures, OUT, SCRIPTS, TONES, _is_faststart, script, sh  # noqa: E402
 from _common import probe  # noqa: E402
 
 
@@ -44,6 +44,23 @@ class EditingTests(MediaFixtures):
         out = OUT / "cut_concat_faststart.mp4"
         script("cut.py", self.src, "--segments", "1-3,6-9", "-o", out)
         self.assertTrue(_is_faststart(out), "cut.py's multi-segment concat join must write +faststart")
+
+    def test_cut_copy_keeps_no_frame_past_the_end(self):
+        """A stream copy stops on decode order, so with B-frames it kept the next GOP's keyframe and
+        a frame after it: "keep 0-2 and 4-6" on a source with a keyframe every second played two
+        frames of the removed 2-4 s span at the join, reported as a lossless copy. Every boundary
+        here is a closed-GOP keyframe, so the copy can and must hold exactly the requested frames."""
+        src = OUT / "closed_gop.mp4"
+        sh("ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30",
+           "-f", "lavfi", "-i", f"aevalsrc='{TONES}':s=48000", "-t", "6", "-c:v", "libx264", "-preset", "veryfast",
+           "-g", "30", "-keyint_min", "30", "-sc_threshold", "0", "-bf", "2", "-pix_fmt", "yuv420p", "-c:a", "aac", src)
+        for args, frames in ((["--segments", "0-2,4-6"], 120), (["--start", "1", "--end", "3"], 60)):
+            out = OUT / "cut_no_tail.mp4"
+            doc = json.loads(script("cut.py", src, *args, "-o", out, "--overwrite", "--json").stdout)
+            self.assertEqual(doc["mode"], "copy", args)
+            decoded = subprocess.run(["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries",
+                                      "stream=nb_read_frames", "-of", "csv=p=0", str(out)], stdout=subprocess.PIPE, text=True).stdout
+            self.assertEqual(int(decoded.strip()), frames, f"{args}: frames past the requested end were kept")
 
     def test_cut_segments_accurate(self):
         out = OUT / "cut2.mp4"
